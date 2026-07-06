@@ -14,15 +14,30 @@ import numpy as np
 import pandas as pd
 
 
-def deseasonalize(g, signal):
-    """Subtract the dow x hour-of-day median so a recurring daily trough
-    isn't read as a step. Returns a numpy array aligned to g's rows.
+def deseasonalize(g, signal, time_col="hour", grain="hourly"):
+    """Subtract a seasonal median so a recurring pattern isn't read as a step.
+    Returns a numpy array aligned to g's rows.
 
-    g:      DataFrame for ONE entity, must contain 'hour' (datetime) and `signal`.
-    signal: column name to deseasonalise (e.g. 'win_rate', 'avg_win_price').
+    g:         DataFrame for ONE entity, must contain `time_col` (datetime)
+               and `signal`.
+    signal:    column name to deseasonalise (e.g. 'win_rate', 'avg_win_price').
+    time_col:  name of the datetime column (default 'hour' for Models 01-03).
+    grain:     'hourly' — seasonal key = (dayofweek, hour-of-day).  Default;
+                          exactly reproduces the v0.1.0 behaviour.
+               'daily'  — seasonal key = dayofweek only.  Used by Model 05
+                          (headline sensing on daily AAPV × RPM data).
+               Any other value raises ValueError (fail fast, no silent fallback).
     """
+    if grain not in ("hourly", "daily"):
+        raise ValueError(
+            f"grain must be 'hourly' or 'daily', got {grain!r}"
+        )
     s = g[signal].astype(float)
-    grp_med = s.groupby([g["hour"].dt.dayofweek, g["hour"].dt.hour]).transform("median")
+    ts = g[time_col]
+    if grain == "hourly":
+        grp_med = s.groupby([ts.dt.dayofweek, ts.dt.hour]).transform("median")
+    else:  # daily
+        grp_med = s.groupby(ts.dt.dayofweek).transform("median")
     return (s - grp_med).to_numpy()
 
 
