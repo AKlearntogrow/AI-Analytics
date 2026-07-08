@@ -10,10 +10,14 @@ from detector.engine import (
     downward_cusum,
     score_series,
 )
+from detector.events import emit_event
+from detector.verifier import verify_event
 
 __all__ = [
     "deseasonalize",
     "robust_scale",
     "downward_cusum",
     "score_series",
+    "emit_event",
+    "verify_event",
 ]
