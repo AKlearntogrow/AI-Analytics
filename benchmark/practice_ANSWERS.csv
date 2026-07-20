@@ -1,0 +1,10 @@
+# ANSWER KEY for the practice set. OPEN AFTER labelling each practice chart — this is the feedback that makes practice useful. Contains ONLY practice events; no benchmark event appears here.
+practice_id,event_id,entity,signal,onset_ts,check6_vote,check3_classification,est_daily_revenue_delta
+P001,20ddf3d4-4685-4dc9-8372-8642e13b5eff,Microsoft,rpm,2025-01-02T00:00:00+00:00,UNDERMINE,MONETIZATION,-835.14
+P002,09745963-9ca8-476b-b26d-c787c9620fcd,VoxMedia,rpm,2025-12-26T00:00:00+00:00,UNDERMINE,MONETIZATION,-12234.48
+P003,b85afa98-f7e7-4e72-b973-766b80f0c20d,Chess.com,aapv,2025-06-24T00:00:00+00:00,UNDERMINE,VOLUME,-90.18
+P004,c546f862-a428-423a-b29b-4190a8cb89df,Orange,aapv,2025-12-22T00:00:00+00:00,UNDERMINE,COMPOUND,-855.34
+P005,e817ada5-60e8-432d-870b-05a355d56b7e,Kleinanzeigen,aapv,2025-12-14T00:00:00+00:00,UNDERMINE,COMPOUND,-935.24
+P006,f15bcac3-bf43-4d6d-9819-21d479dc1dbf,Microsoft,rpm,2025-07-30T00:00:00+00:00,UNDERMINE,MONETIZATION,-935.61
+P007,bfadf397-8854-4fb2-bc85-e951767b2129,Turner-Broadcasting,rpm,2024-07-27T00:00:00+00:00,UNDERMINE,COMPOUND,-540.11
+P008,b25cdd21-d292-4c5b-83a3-893bd833b79c,Fandom,aapv,2025-04-30T00:00:00+00:00,UNDERMINE,VOLUME,-584.29
