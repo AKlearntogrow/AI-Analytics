@@ -11,8 +11,10 @@ anywhere else.
 Implemented checks:
   - check 1: data-integrity gate (terminal on FAIL — verdict KILL).
   - check 2: persistence — did the drop persist after onset, or recover?
+  - check 3: cross-signal classification (VOLUME / MONETIZATION / COMPOUND /
+    NO_CROSS_SIGNAL). Classification only — vote is always NEUTRAL.
   - check 6: seasonal twin — is this a recurring annual drop?
-Checks 3–5 and 7 are recorded as NOT_IMPLEMENTED until implemented.
+Checks 4, 5, and 7 are recorded as NOT_IMPLEMENTED until implemented.
 """
 
 from __future__ import annotations
@@ -28,9 +30,9 @@ _EVENTS_TABLE = "marble-light.operational_intelligence.events"
 _VERDICTS_TABLE = "marble-light.operational_intelligence.verdicts"
 _REV_TRACKER_TABLE = "marble-light.counters.rev_tracker"
 
-_CONFIG_VERSION = "verifier-0.0.3-check6"
-_NOT_IMPLEMENTED_CAVEAT = "checks 3–5 and 7 not yet implemented"
-_UNIMPLEMENTED_CHECKS = ("check_3", "check_4", "check_5", "check_7")
+_CONFIG_VERSION = "verifier-0.0.4-check3"
+_NOT_IMPLEMENTED_CAVEAT = "checks 4, 5, and 7 not yet implemented"
+_UNIMPLEMENTED_CHECKS = ("check_4", "check_5", "check_7")
 
 _REV_TRACKER_ENTITY_COL = "orgName"
 _REV_TRACKER_TS_COL = "date"
@@ -40,6 +42,11 @@ BASELINE_DAYS = 28
 POST_DAYS = 14
 PERSISTENCE_THRESHOLD = 0.10
 MIN_POST_DAYS = 7
+
+# ---- Check 3 (cross-signal classification) ----
+# ratio band around 1.0 within which a signal is "flat"; strict < and >
+# outside the band flag "down" / "up" respectively.
+MATERIAL_CHANGE = 0.10
 
 # ---- Check 6 (seasonal twin) ----
 TWIN_LOOKBACK_YEARS = 2
@@ -237,6 +244,117 @@ def _run_check_2(bq: Any, entity: str, onset_ts: datetime, sql: str) -> dict:
         "baseline_n": len(baseline),
         "post_n": len(post),
     }
+
+
+# ---------------------------------------------------------------------------
+# Check 3 — cross-signal classification (NEUTRAL vote — label only)
+# ---------------------------------------------------------------------------
+
+def _signal_stats(rows: list, onset_day: date) -> dict:
+    """Baseline mean over [onset - BASELINE_DAYS, onset) and post mean over
+    [onset, onset + POST_DAYS] — CLOSED post window matching check 2's
+    convention (15 rows; onset day counts as post). Spec said half-open;
+    we chose consistency with check 2 over spec literalism so check 2 and
+    check 3 always see the same window for the same event — the invariant
+    tests in test_verifier.py enforce this.
+    Nulls are dropped. ratio is post/baseline, or None if baseline is
+    missing/zero.
+    """
+    post_end_inclusive = onset_day + timedelta(days=POST_DAYS)
+    baseline_vals = [
+        float(r["value"]) for r in rows
+        if r["d"] < onset_day and r["value"] is not None
+    ]
+    post_vals = [
+        float(r["value"]) for r in rows
+        if onset_day <= r["d"] <= post_end_inclusive and r["value"] is not None
+    ]
+    baseline_mean = statistics.mean(baseline_vals) if baseline_vals else None
+    post_mean = statistics.mean(post_vals) if post_vals else None
+    if baseline_mean is not None and baseline_mean > 0 and post_mean is not None:
+        ratio = post_mean / baseline_mean
+    else:
+        ratio = None
+    return {
+        "baseline_mean": baseline_mean,
+        "post_mean": post_mean,
+        "ratio": ratio,
+        "days_post": len(post_vals),
+    }
+
+
+def _bucket_ratio(ratio: float) -> str:
+    if ratio < 1.0 - MATERIAL_CHANGE:
+        return "down"
+    if ratio > 1.0 + MATERIAL_CHANGE:
+        return "up"
+    return "flat"
+
+
+def _classify_cross_signal(aapv_state: str, rpm_state: str) -> str:
+    aapv_down = aapv_state == "down"
+    rpm_down = rpm_state == "down"
+    if aapv_down and rpm_down:
+        return "COMPOUND"
+    if aapv_down:
+        return "VOLUME"
+    if rpm_down:
+        return "MONETIZATION"
+    return "NO_CROSS_SIGNAL"
+
+
+def _run_check_3(
+    bq: Any, entity: str, onset_ts: datetime, aapv_sql: str, rpm_sql: str,
+) -> dict:
+    """Cross-signal classification. Always votes NEUTRAL.
+
+    Fetches both aapv and rpm daily series over check 2's window, then
+    classifies via the 2x2 down/flat/up table from SPEC_check3. If either
+    signal lacks enough post data or has a zero/null baseline mean,
+    classification is INSUFFICIENT_DATA (still non-voting).
+    """
+    onset_day = onset_ts.date()
+    start_date = onset_day - timedelta(days=BASELINE_DAYS)
+    end_date = onset_day + timedelta(days=POST_DAYS)
+
+    aapv_rows = _fetch_series(bq, entity, aapv_sql, start_date, end_date)
+    rpm_rows = _fetch_series(bq, entity, rpm_sql, start_date, end_date)
+
+    aapv_stats = _signal_stats(aapv_rows, onset_day)
+    rpm_stats = _signal_stats(rpm_rows, onset_day)
+
+    payload: dict = {
+        "status": "IMPLEMENTED",
+        "vote": "NEUTRAL",
+        "aapv": aapv_stats,
+        "rpm": rpm_stats,
+    }
+
+    reasons: list[str] = []
+    for name, stats in (("aapv", aapv_stats), ("rpm", rpm_stats)):
+        if stats["days_post"] < MIN_POST_DAYS:
+            reasons.append(f"{name} days_post={stats['days_post']}<{MIN_POST_DAYS}")
+        elif stats["baseline_mean"] is None or stats["baseline_mean"] <= 0:
+            reasons.append(f"{name} baseline_mean={stats['baseline_mean']!r}")
+
+    if reasons:
+        payload["classification"] = "INSUFFICIENT_DATA"
+        payload["reason"] = "; ".join(reasons)
+        payload["est_daily_revenue_delta"] = None
+        return payload
+
+    aapv_state = _bucket_ratio(aapv_stats["ratio"])
+    rpm_state = _bucket_ratio(rpm_stats["ratio"])
+    classification = _classify_cross_signal(aapv_state, rpm_state)
+
+    baseline_daily_rev = (
+        aapv_stats["baseline_mean"] * rpm_stats["baseline_mean"] / 1000.0
+    )
+    post_daily_rev = aapv_stats["post_mean"] * rpm_stats["post_mean"] / 1000.0
+
+    payload["classification"] = classification
+    payload["est_daily_revenue_delta"] = post_daily_rev - baseline_daily_rev
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -470,20 +588,32 @@ def verify_event(event_id: str, *, client: Any = None) -> dict:
             "check 6",
         )
 
+    # Check 3 always runs — it needs BOTH signals regardless of event['signal'].
+    aapv_sql = _series_sql_for("aapv")
+    rpm_sql = _series_sql_for("rpm")
+    check_3_result = _safely(
+        lambda: _run_check_3(bq, event["entity"], onset_ts, aapv_sql, rpm_sql),
+        "check 3",
+    )
+
     check_results: dict = {
         "check_1": check_1_result,
         "check_2": check_2_result,
+        "check_3": check_3_result,
         "check_6": check_6_result,
     }
     for name in _UNIMPLEMENTED_CHECKS:
         check_results[name] = {"status": "NOT_IMPLEMENTED"}
 
-    verdict = _decide_verdict(check_1_result, [check_2_result, check_6_result])
+    verdict = _decide_verdict(
+        check_1_result, [check_2_result, check_3_result, check_6_result]
+    )
 
     if verdict == "PASS_WITH_CAVEATS":
         check_results["caveats"] = _build_caveats([
             ("check_1", check_1_result),
             ("check_2", check_2_result),
+            ("check_3", check_3_result),
             ("check_6", check_6_result),
         ])
 
@@ -493,6 +623,8 @@ def verify_event(event_id: str, *, client: Any = None) -> dict:
         # clarity in evidence_refs (they run against different DATE params).
         evidence_refs["check_2_sql"] = series_sql
         evidence_refs["check_6_sql"] = series_sql
+    evidence_refs["check_3_aapv_sql"] = aapv_sql
+    evidence_refs["check_3_rpm_sql"] = rpm_sql
 
     runtime_seconds = time.monotonic() - started
 

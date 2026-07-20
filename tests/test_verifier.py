@@ -1,13 +1,16 @@
-"""Tests for detector.verifier.verify_event — checks 1, 2, 6. BigQuery mocked.
+"""Tests for detector.verifier.verify_event — checks 1, 2, 3, 6. BigQuery mocked.
 
 Coverage:
   Check 1 (data-integrity gate, terminal on FAIL) — tracer cases carried over.
   Check 2 (persistence) — SUPPORT, UNDERMINE, three NEUTRAL paths, boundary,
     RPM sums-then-divide aggregation.
+  Check 3 (cross-signal classification) — VOLUME / MONETIZATION / COMPOUND /
+    NO_CROSS_SIGNAL, boundary, INSUFFICIENT_DATA, errored, non-voting
+    regression, est_daily_revenue_delta.
   Check 6 (seasonal twin) — UNDERMINE (exact), UNDERMINE via tolerance,
     SUPPORT (no twin), two NEUTRAL paths (no data, query raises),
     pre_regime flag, shared-SQL regression.
-  Verdict wiring across the three checks; hard read-only constraint.
+  Verdict wiring across the four checks; hard read-only constraint.
 
 All BigQuery I/O is stubbed via a fake client — no ADC, no network.
 """
@@ -23,6 +26,8 @@ from detector import verify_event
 from detector import verifier as verifier_mod
 from detector.verifier import (
     BASELINE_DAYS,
+    MATERIAL_CHANGE,
+    MIN_POST_DAYS,
     POST_DAYS,
     TWIN_WINDOW_TOLERANCE_DAYS,
 )
@@ -45,14 +50,17 @@ class _FakeQueryJob:
 
 class _FakeBQ:
     """Routes SQL by substring; series queries are further routed by window
-    span so we can distinguish check 2 (span = BASELINE_DAYS + POST_DAYS)
+    span so we can distinguish check 2/3 (span = BASELINE_DAYS + POST_DAYS)
     from check 6 (span = ... + 2 * TWIN_WINDOW_TOLERANCE_DAYS) and by
     @start_date's year (for per-year check-6 series).
 
-      - "COUNT(*)"                                    -> check 1 (count row)
-      - "rev_tracker" + span 42                        -> check 2 series
-      - "rev_tracker" + span 62                        -> check 6 series (year-routed)
-      - "operational_intelligence.events"              -> event fetch
+      - "COUNT(*)"                             -> check 1 (count row)
+      - "rev_tracker" + span 42                 -> check 2 (1st) or check 3 (2nd+)
+                                                  routed by call order; also
+                                                  routed by SAFE_DIVIDE (rpm) vs
+                                                  aa_pageviews-only (aapv) SQL
+      - "rev_tracker" + span 62                 -> check 6 series (year-routed)
+      - "operational_intelligence.events"       -> event fetch
     """
 
     def __init__(
@@ -61,18 +69,25 @@ class _FakeBQ:
         event_rows,
         rev_tracker_count=0,
         default_series=None,
+        series_aapv=None,
+        series_rpm=None,
         series_by_year=None,
         check_2_raises=False,
+        check_3_raises=False,
         check_6_raises=False,
         insert_errors=None,
     ):
         self._event_rows = event_rows
         self._rev_tracker_count = rev_tracker_count
         self._default_series = default_series if default_series is not None else []
+        self._series_aapv = series_aapv
+        self._series_rpm = series_rpm
         self._series_by_year = series_by_year or {}
         self._check_2_raises = check_2_raises
+        self._check_3_raises = check_3_raises
         self._check_6_raises = check_6_raises
         self._insert_errors = insert_errors or []
+        self._span42_calls = 0
         self.queries = []
         self.inserts = []
 
@@ -89,8 +104,28 @@ class _FakeBQ:
             }
             span = (params["end_date"] - params["start_date"]).days
             if span == BASELINE_DAYS + POST_DAYS:
-                if self._check_2_raises:
+                self._span42_calls += 1
+                # COUPLING: the 1st span-42 call is assumed to be check 2,
+                # subsequent calls check 3. This mirrors the check ORDER in
+                # verify_event. SQL alone cannot distinguish them — for a
+                # matching-signal event, check 2's query is byte-identical
+                # to check 3's same-signal query, and adding a per-check
+                # SQL sentinel would leak test structure into production
+                # code.
+                # If you reorder checks in verify_event, update this
+                # mapping. Nothing will fail loudly on a reorder: the query
+                # COUNT is unchanged, so only the ratio-invariant tests are
+                # likely (not guaranteed) to catch it.
+                is_check_2 = self._span42_calls == 1
+                if is_check_2 and self._check_2_raises:
                     raise RuntimeError("simulated check-2 BQ error")
+                if not is_check_2 and self._check_3_raises:
+                    raise RuntimeError("simulated check-3 BQ error")
+                is_rpm = "SAFE_DIVIDE" in sql
+                if is_rpm and self._series_rpm is not None:
+                    return _FakeQueryJob(self._series_rpm)
+                if not is_rpm and self._series_aapv is not None:
+                    return _FakeQueryJob(self._series_aapv)
                 return _FakeQueryJob(self._default_series)
             # else: check 6 (wider window)
             if self._check_6_raises:
@@ -197,13 +232,14 @@ def test_check_1_pass_and_check_2_support_yields_pass_with_caveats():
     assert result["check_results"]["check_1"]["status"] == "PASS"
     assert result["check_results"]["check_1"]["rows_found"] == 17
     assert result["check_results"]["check_2"]["status"] == "SUPPORT"
+    assert result["check_results"]["check_3"]["status"] == "IMPLEMENTED"
     assert result["check_results"]["check_6"]["status"] == "SUPPORT"
-    for name in ("check_3", "check_4", "check_5", "check_7"):
+    for name in ("check_4", "check_5", "check_7"):
         assert result["check_results"][name] == {"status": "NOT_IMPLEMENTED"}
     assert result["check_results"]["caveats"] == [
-        "checks 3–5 and 7 not yet implemented"
+        "checks 4, 5, and 7 not yet implemented"
     ]
-    assert result["config_version"] == "verifier-0.0.3-check6"
+    assert result["config_version"] == "verifier-0.0.4-check3"
 
     assert len(bq.inserts) == 1
     table, rows = bq.inserts[0]
@@ -211,22 +247,28 @@ def test_check_1_pass_and_check_2_support_yields_pass_with_caveats():
     row = rows[0]
     assert row["event_id"] == "evt-123"
     assert row["verdict"] == "PASS_WITH_CAVEATS"
-    assert row["config_version"] == "verifier-0.0.3-check6"
+    assert row["config_version"] == "verifier-0.0.4-check3"
     assert row["brief_md"] is None
     assert row["onset_ts"] == "2026-05-23T00:00:00+00:00"
 
     parsed_checks = json.loads(row["check_results"])
     assert parsed_checks["check_1"]["status"] == "PASS"
     assert parsed_checks["check_2"]["status"] == "SUPPORT"
+    assert parsed_checks["check_3"]["status"] == "IMPLEMENTED"
     assert parsed_checks["check_6"]["status"] == "SUPPORT"
-    assert parsed_checks["caveats"] == ["checks 3–5 and 7 not yet implemented"]
+    assert parsed_checks["caveats"] == ["checks 4, 5, and 7 not yet implemented"]
 
     parsed_refs = json.loads(row["evidence_refs"])
     assert "check_1_sql" in parsed_refs
     assert "check_2_sql" in parsed_refs
+    assert "check_3_aapv_sql" in parsed_refs
+    assert "check_3_rpm_sql" in parsed_refs
     assert "check_6_sql" in parsed_refs
     # Check 2 and check 6 share the same SQL string; different DATE params.
     assert parsed_refs["check_2_sql"] == parsed_refs["check_6_sql"]
+    # Check 3 aapv SQL == check 2 SQL when event signal is aapv (shared helper).
+    assert parsed_refs["check_3_aapv_sql"] == parsed_refs["check_2_sql"]
+    assert "SAFE_DIVIDE" in parsed_refs["check_3_rpm_sql"]
 
 
 def test_check_1_fail_yields_kill():
@@ -272,11 +314,12 @@ def test_events_then_check1_then_series_queries_then_verdicts_insert():
     )
     verify_event("evt-order", client=bq)
 
-    # events fetch, check 1 COUNT, check 2 series, check 6 year 1, check 6 year 2
-    assert len(bq.queries) == 5
+    # events fetch, check 1 COUNT, check 2 series, check 6 y1, check 6 y2,
+    # check 3 aapv, check 3 rpm
+    assert len(bq.queries) == 7
     assert "operational_intelligence.events" in bq.queries[0][0]
     assert "COUNT(*)" in bq.queries[1][0]
-    for sql, _ in bq.queries[2:5]:
+    for sql, _ in bq.queries[2:7]:
         assert "rev_tracker" in sql and "COUNT(*)" not in sql
     assert len(bq.inserts) == 1
 
@@ -651,7 +694,7 @@ def test_verdict_check1_pass_check2_undermine_is_pass_with_caveats_with_caveat()
     assert result["verdict"] == "PASS_WITH_CAVEATS"
     caveats = result["check_results"]["caveats"]
     assert any(c.startswith("check_2 UNDERMINE") for c in caveats)
-    assert "checks 3–5 and 7 not yet implemented" in caveats
+    assert "checks 4, 5, and 7 not yet implemented" in caveats
     assert len(bq.inserts) == 1
 
 
@@ -673,6 +716,241 @@ def test_verdict_check2_undermine_plus_check6_undermine_still_pass_with_caveats(
     caveats = result["check_results"]["caveats"]
     assert any(c.startswith("check_2 UNDERMINE") for c in caveats)
     assert any(c.startswith("check_6 UNDERMINE") for c in caveats)
+
+
+# ---------------------------------------------------------------------------
+# check-3 (cross-signal classification) — logic
+# ---------------------------------------------------------------------------
+
+def _c3_flat_years():
+    """Prior-year series so check 6 stays SUPPORT and doesn't clutter check-3
+    tests."""
+    return _no_twin_default_years()
+
+
+def test_check_3_volume_when_aapv_down_rpm_flat():
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 50.0),
+        series_rpm=_series(4.0, 4.0),
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-vol", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["status"] == "IMPLEMENTED"
+    assert c3["vote"] == "NEUTRAL"
+    assert c3["classification"] == "VOLUME"
+    assert c3["aapv"]["baseline_mean"] == 100.0
+    assert c3["aapv"]["post_mean"] == 50.0
+    # CLOSED post window matching check 2: POST_DAYS + 1 rows (onset day + 14).
+    assert c3["aapv"]["days_post"] == POST_DAYS + 1
+    assert c3["rpm"]["baseline_mean"] == 4.0
+    assert c3["rpm"]["post_mean"] == 4.0
+    # est_delta = (50 * 4 - 100 * 4) / 1000 = -0.2
+    assert c3["est_daily_revenue_delta"] == pytest.approx(-0.2)
+
+
+def test_check_3_monetization_when_rpm_down_aapv_flat():
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 100.0),
+        series_rpm=_series(4.0, 2.0),
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-mon", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["classification"] == "MONETIZATION"
+    assert c3["vote"] == "NEUTRAL"
+
+
+def test_check_3_compound_when_both_down():
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 50.0),
+        series_rpm=_series(4.0, 2.0),
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-comp", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["classification"] == "COMPOUND"
+    # est_delta = (50 * 2 - 100 * 4) / 1000 = (0.1 - 0.4) = -0.3
+    assert c3["est_daily_revenue_delta"] == pytest.approx(-0.3)
+
+
+def test_check_3_no_cross_signal_when_both_flat():
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 100.0),
+        series_rpm=_series(4.0, 4.0),
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-nocross", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["classification"] == "NO_CROSS_SIGNAL"
+    assert c3["est_daily_revenue_delta"] == pytest.approx(0.0)
+
+
+def test_check_3_boundary_ratio_exactly_at_threshold_is_flat():
+    """Per SPEC test 5: ratio exactly at (1 - MATERIAL_CHANGE) is NOT down.
+    baseline 100, post 90 -> ratio 0.9 == 1 - 0.10, must classify as flat."""
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 90.0),
+        series_rpm=_series(4.0, 4.0),
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-boundary", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["aapv"]["ratio"] == pytest.approx(1.0 - MATERIAL_CHANGE)
+    assert c3["classification"] == "NO_CROSS_SIGNAL"
+
+
+def test_check_3_insufficient_data_when_post_days_too_few():
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 50.0, post_days=5),   # < MIN_POST_DAYS
+        series_rpm=_series(4.0, 4.0),
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-thin", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["status"] == "IMPLEMENTED"
+    assert c3["vote"] == "NEUTRAL"
+    assert c3["classification"] == "INSUFFICIENT_DATA"
+    assert "aapv days_post=5" in c3["reason"]
+    assert c3["est_daily_revenue_delta"] is None
+    assert c3["aapv"]["days_post"] == 5
+    assert c3["rpm"]["days_post"] >= MIN_POST_DAYS
+
+
+def test_check_3_insufficient_data_when_baseline_zero():
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 50.0),
+        series_rpm=_series(0.0, 4.0),                    # rpm baseline mean == 0
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-zerobase", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["classification"] == "INSUFFICIENT_DATA"
+    assert "rpm baseline_mean" in c3["reason"]
+
+
+def test_check_3_errored_yields_neutral_with_sql_preserved():
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=1,
+        default_series=_series(100.0, 50.0),
+        series_by_year=_c3_flat_years(),
+        check_3_raises=True,
+    )
+    result = verify_event("evt-c3-boom", client=bq)
+    c3 = result["check_results"]["check_3"]
+    assert c3["status"] == "NEUTRAL"
+    assert c3["errored"] is True
+    assert "check 3 errored" in c3["detail"]
+    # verdict unchanged; check 3 is non-voting
+    assert result["verdict"] == "PASS_WITH_CAVEATS"
+    # SQLs recorded up front, survive the raise
+    assert "check_3_aapv_sql" in result["evidence_refs"]
+    assert "check_3_rpm_sql" in result["evidence_refs"]
+    assert "SAFE_DIVIDE" in result["evidence_refs"]["check_3_rpm_sql"]
+    assert "SAFE_DIVIDE" not in result["evidence_refs"]["check_3_aapv_sql"]
+    # errored check_3 (NEUTRAL) DOES surface as a caveat
+    caveats = result["check_results"]["caveats"]
+    assert any(c.startswith("check_3 NEUTRAL") for c in caveats)
+
+
+def test_check_3_does_not_flip_verdict_when_kill_conditions_met():
+    """Regression: check 3 is non-voting. A COMPOUND classification alongside
+    check 2 UNDERMINE + check 6 UNDERMINE still yields PASS_WITH_CAVEATS
+    (because check 1 PASS counts as SUPPORT — BENCHMARK REVIEW item)."""
+    bq = _FakeBQ(
+        event_rows=[_event_row()],
+        rev_tracker_count=17,
+        default_series=_series(100.0, 100.0),   # check 2 UNDERMINE
+        series_aapv=_series(100.0, 50.0),
+        series_rpm=_series(4.0, 2.0),           # check 3 COMPOUND
+        series_by_year={
+            2025: _twin_series(100.0, 50.0, anchor=date(2025, 5, 23)),   # check 6 UNDERMINE
+            2024: _twin_series(100.0, 50.0, anchor=date(2024, 5, 23)),
+        },
+    )
+    result = verify_event("evt-c3-nonvoting", client=bq)
+    assert result["verdict"] == "PASS_WITH_CAVEATS"
+    assert result["check_results"]["check_3"]["classification"] == "COMPOUND"
+    caveats = result["check_results"]["caveats"]
+    # successful check 3 stays silent — no caveat entry for it
+    assert not any(c.startswith("check_3") for c in caveats)
+
+
+def test_check_2_and_check_3_ratios_agree_for_aapv_event():
+    """Invariant tripwire: for an aapv-signal event, check 2's persistence
+    ratio (post_median / baseline_median) and check 3's aapv ratio must be
+    equal. Any drift means checks 2 and 3 have diverged on window bounds,
+    series aggregation, or null filtering — catch it loudly here.
+
+    Uses a constant per-window series so median == mean and the only thing
+    under test is window/series/aggregation identity.
+    """
+    bq = _FakeBQ(
+        event_rows=[_event_row(signal="aapv")],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 60.0),
+        series_rpm=_series(4.0, 4.0),
+        series_by_year=_no_twin_default_years(),
+    )
+    result = verify_event("evt-invariant-aapv", client=bq)
+    c2 = result["check_results"]["check_2"]
+    c3_aapv = result["check_results"]["check_3"]["aapv"]
+    c2_ratio = c2["post_median"] / c2["baseline_median"]
+    assert c3_aapv["ratio"] == pytest.approx(c2_ratio)
+    # window identity: same post row count → same window bounds.
+    assert c3_aapv["days_post"] == c2["post_n"]
+
+
+def test_check_2_and_check_3_ratios_agree_for_rpm_event():
+    """Mirror of the aapv invariant for an rpm-signal event — same
+    rationale, exercises the SAFE_DIVIDE path."""
+    bq = _FakeBQ(
+        event_rows=[_event_row(signal="rpm")],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 100.0),
+        series_rpm=_series(4.0, 3.0),
+        series_by_year=_no_twin_default_years(),
+    )
+    result = verify_event("evt-invariant-rpm", client=bq)
+    c2 = result["check_results"]["check_2"]
+    c3_rpm = result["check_results"]["check_3"]["rpm"]
+    c2_ratio = c2["post_median"] / c2["baseline_median"]
+    assert c3_rpm["ratio"] == pytest.approx(c2_ratio)
+    assert c3_rpm["days_post"] == c2["post_n"]
+
+
+def test_check_3_runs_when_event_signal_unsupported():
+    """Event with an unknown signal: check 2/6 skip (unsupported NEUTRAL) but
+    check 3 still runs since it always fetches both aapv and rpm regardless
+    of event['signal']."""
+    bq = _FakeBQ(
+        event_rows=[_event_row(signal="wat")],
+        rev_tracker_count=1,
+        series_aapv=_series(100.0, 100.0),
+        series_rpm=_series(4.0, 4.0),
+        series_by_year=_c3_flat_years(),
+    )
+    result = verify_event("evt-c3-unknown", client=bq)
+    assert result["check_results"]["check_2"]["status"] == "NEUTRAL"
+    assert result["check_results"]["check_6"]["status"] == "NEUTRAL"
+    c3 = result["check_results"]["check_3"]
+    assert c3["status"] == "IMPLEMENTED"
+    assert c3["classification"] == "NO_CROSS_SIGNAL"
 
 
 def test_verdict_check1_fail_kills_regardless_of_check_2_and_check_6():
