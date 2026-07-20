@@ -51,6 +51,10 @@ from detector.verifier import (
 # ---- Constants (all sample selection depends on these + RANDOM_SEED) ----
 RANDOM_SEED = 20260720
 CONFIG_VERSION = "verifier-0.0.4-check3"
+# Frozen sampling date — the day the v1 sample was chosen. Recorded in
+# the KEY header so re-rendering plots later doesn't rewrite history.
+# The recency guard still uses date.today() — that IS about "right now".
+SAMPLING_DATE = date(2026, 7, 20)
 EXPECTED_SURVIVORS = 29
 EXPECTED_KILLED = 47
 N_KILLED_SAMPLE = 15
@@ -64,6 +68,7 @@ PLOT_POST_DAYS = 60
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_DIR = REPO_ROOT / "benchmark"
 PLOTS_DIR = BENCHMARK_DIR / "plots_v1"
+SMOKE_DIR = BENCHMARK_DIR / "plots_smoketest"
 TEMPLATE_PATH = BENCHMARK_DIR / "labels_v1_TEMPLATE.csv"
 KEY_PATH = BENCHMARK_DIR / "labels_v1_KEY.csv"
 GRAHAM_PATH = BENCHMARK_DIR / "labels_v1_graham_TEMPLATE.csv"
@@ -254,6 +259,96 @@ def _render_plot(label_id, signal, rows, onset_day, out_path, baseline_mean):
     plt.close(fig)
 
 
+def _render_placeholder(label_id, signal, out_path, message):
+    """Render a full-size PNG carrying only `message` — no axes, no fake
+    data. Used when an event cannot be normalized (e.g., zero baseline
+    data). Every label_id gets a PNG so the labeller never opens a
+    missing-file confusion; the message tells them to mark UNSURE."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.text(
+        0.5, 0.5, message, ha="center", va="center", fontsize=18,
+        transform=ax.transAxes,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title(f"{label_id}   signal: {signal}")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=100)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Smoke test — synthetic series through the real rendering code path
+# ---------------------------------------------------------------------------
+
+def _smoke_test() -> int:
+    """Render 3 synthetic plots to SMOKE_DIR. NO BigQuery. NO real series
+    values. Purpose: verify normalization, axis labels, onset marker, and
+    gap-as-gap rendering without opening any real sampled plot before
+    labelling.
+
+    Cases:
+      A — clean step-down at onset (baseline flat 100 -> post flat 50);
+          checks normalization + onset marker + index=50 on Y post-onset.
+      B — noisy flat series (~100 pre and post, fixed-seed gaussian noise);
+          checks that normal wobble stays within the ~[80, 120] band and
+          that the plot doesn't scream "change" when there isn't one.
+      C — two-level series (100 pre, 60 post) with a 10-day gap straddling
+          the transition; verifies matplotlib does NOT draw a diagonal
+          connector across the missing days — a gap must look like a gap,
+          not like interpolation or a floor of zeros.
+    """
+    import random as _random
+
+    SMOKE_DIR.mkdir(parents=True, exist_ok=True)
+    onset_day = date(2026, 1, 15)  # arbitrary; smoke test doesn't touch BQ
+
+    def _write(rows, label_id, signal, filename):
+        baseline_mean, _ = _normalize(rows, onset_day)
+        _render_plot(label_id, signal, rows, onset_day,
+                     SMOKE_DIR / filename, baseline_mean)
+        print(f"  wrote {filename}  (baseline_mean={baseline_mean:.2f})")
+
+    # --- Case A: clean step-down
+    rows_a: list[dict] = []
+    for i in range(PLOT_PRE_DAYS, 0, -1):
+        rows_a.append({"d": onset_day - timedelta(days=i), "value": 100.0})
+    for i in range(PLOT_POST_DAYS + 1):
+        rows_a.append({"d": onset_day + timedelta(days=i), "value": 50.0})
+    _write(rows_a, "SMOKE_A", "aapv", "SMOKE_A_step_down.png")
+
+    # --- Case B: noisy flat around baseline (fixed seed)
+    rng = _random.Random(42)
+    rows_b: list[dict] = []
+    for i in range(PLOT_PRE_DAYS, 0, -1):
+        rows_b.append({"d": onset_day - timedelta(days=i),
+                       "value": 100.0 + rng.gauss(0, 8)})
+    for i in range(PLOT_POST_DAYS + 1):
+        rows_b.append({"d": onset_day + timedelta(days=i),
+                       "value": 100.0 + rng.gauss(0, 8)})
+    _write(rows_b, "SMOKE_B", "rpm", "SMOKE_B_noisy_flat.png")
+
+    # --- Case C: step + 10-day gap straddling onset (days -4..+5)
+    rows_c: list[dict] = []
+    for i in range(PLOT_PRE_DAYS, 0, -1):
+        val = None if 1 <= i <= 4 else 100.0
+        rows_c.append({"d": onset_day - timedelta(days=i), "value": val})
+    for i in range(PLOT_POST_DAYS + 1):
+        val = None if 0 <= i <= 5 else 60.0
+        rows_c.append({"d": onset_day + timedelta(days=i), "value": val})
+    _write(rows_c, "SMOKE_C", "aapv", "SMOKE_C_gap.png")
+
+    print(f"\nSmoke test complete — 3 plots in "
+          f"{SMOKE_DIR.relative_to(REPO_ROOT)}. No BigQuery calls made.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CSV writers
 # ---------------------------------------------------------------------------
@@ -268,7 +363,7 @@ def _write_template(assigned, path: Path) -> None:
             w.writerow([r["label_id"], r["signal"], "", "", "", ""])
 
 
-def _write_key(assigned, path: Path, sampling_date: date) -> None:
+def _write_key(assigned, path: Path) -> None:
     """Rejoin key. Not to be read until labelling is complete."""
     with open(path, "w", newline="", encoding="utf-8") as f:
         f.write(
@@ -277,7 +372,7 @@ def _write_key(assigned, path: Path, sampling_date: date) -> None:
             "reproducibility, not for reading.\n"
         )
         f.write(
-            f"# sampling_date: {sampling_date.isoformat()}, "
+            f"# sampling_date: {SAMPLING_DATE.isoformat()}, "
             f"random_seed: {RANDOM_SEED}, "
             f"config_version: {CONFIG_VERSION}\n"
         )
@@ -364,11 +459,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build the blinded v1 labelling package (44 events)."
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--dry-run", action="store_true",
         help="Fetch + assign + print composition; skip files/plots.",
     )
+    mode.add_argument(
+        "--smoke-test", action="store_true",
+        help="Render 3 synthetic plots to benchmark/plots_smoketest/ to "
+             "verify the rendering pipeline. No BigQuery, no real series.",
+    )
     args = parser.parse_args()
+
+    if args.smoke_test:
+        return _smoke_test()
 
     bq = _default_client()
     print(f"Fetching latest verdicts under {CONFIG_VERSION}...")
@@ -417,25 +521,34 @@ def main() -> int:
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"\nFetching series + rendering {len(assigned)} plots...")
-    skipped: list[str] = []
+    placeholders: list[str] = []
+    unsupported: list[str] = []
     for i, r in enumerate(assigned, start=1):
         onset_day = r["onset_ts"].date()
+        out_path = PLOTS_DIR / f"{r['label_id']}.png"
         signal_sql = _series_sql_for(r["signal"])
         if signal_sql is None:
-            skipped.append(f"{r['label_id']} (unsupported signal)")
-            print(f"  [{i:>2}/{len(assigned)}] {r['label_id']} SKIP — "
-                  f"unsupported signal {r['signal']!r}")
+            _render_placeholder(
+                r["label_id"], r["signal"], out_path,
+                "unsupported signal — cannot render",
+            )
+            unsupported.append(r["label_id"])
+            print(f"  [{i:>2}/{len(assigned)}] {r['label_id']}  "
+                  f"PLACEHOLDER (unsupported signal {r['signal']!r})")
             continue
         start = onset_day - timedelta(days=PLOT_PRE_DAYS)
         end = onset_day + timedelta(days=PLOT_POST_DAYS)
         rows = _fetch_series(bq, r["entity"], signal_sql, start, end)
         baseline_mean, baseline_n = _normalize(rows, onset_day)
         if baseline_mean is None or baseline_mean <= 0:
-            skipped.append(f"{r['label_id']} (no baseline data)")
-            print(f"  [{i:>2}/{len(assigned)}] {r['label_id']} SKIP — "
-                  f"no baseline data (n={baseline_n})")
+            _render_placeholder(
+                r["label_id"], r["signal"], out_path,
+                "insufficient baseline data to normalize",
+            )
+            placeholders.append(r["label_id"])
+            print(f"  [{i:>2}/{len(assigned)}] {r['label_id']}  "
+                  f"PLACEHOLDER (no baseline data, n={baseline_n})")
             continue
-        out_path = PLOTS_DIR / f"{r['label_id']}.png"
         _render_plot(r["label_id"], r["signal"], rows, onset_day,
                      out_path, baseline_mean)
         print(f"  [{i:>2}/{len(assigned)}] {r['label_id']}  "
@@ -443,7 +556,7 @@ def main() -> int:
 
     _write_template(assigned, TEMPLATE_PATH)
     print(f"\nWrote {TEMPLATE_PATH.relative_to(REPO_ROOT)}")
-    _write_key(assigned, KEY_PATH, today)
+    _write_key(assigned, KEY_PATH)
     print(f"Wrote {KEY_PATH.relative_to(REPO_ROOT)}  "
           f"(do NOT open until labelling is complete)")
     _write_graham_template(assigned, graham_ids, GRAHAM_PATH)
@@ -453,11 +566,12 @@ def main() -> int:
     for lid in graham_ids:
         print(f"  benchmark/plots_v1/{lid}.png")
 
-    if skipped:
-        print(f"\nSkipped ({len(skipped)}):")
-        for s in skipped:
-            print(f"  {s}")
-        return 1
+    if placeholders or unsupported:
+        print(f"\nPlaceholders ({len(placeholders) + len(unsupported)}):")
+        for lid in placeholders:
+            print(f"  {lid}  (no baseline data)")
+        for lid in unsupported:
+            print(f"  {lid}  (unsupported signal)")
 
     return 0
 

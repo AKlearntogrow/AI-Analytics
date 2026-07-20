@@ -2,6 +2,10 @@
 *.csv
 *.parquet
 *.xlsx
+# ...except the benchmark labels/key/graham files, which ARE the artifacts
+# (schema, IDs, and eventually the labels themselves) — the spec requires
+# labels_v1.csv to live in git.
+!benchmark/*.csv
 
 # Python
 __pycache__/
