@@ -284,6 +284,155 @@ def _render_placeholder(label_id, signal, out_path, message):
 
 
 # ---------------------------------------------------------------------------
+# v2 labelling templates (AK + SE), built from v1 KEY + graham TEMPLATE
+# ---------------------------------------------------------------------------
+
+# v2 output paths — v1 templates stay in git untouched for the record.
+V2_TEMPLATE_AK_PATH = BENCHMARK_DIR / "labels_v2_TEMPLATE_ak.csv"
+V2_TEMPLATE_SE_PATH = BENCHMARK_DIR / "labels_v2_TEMPLATE_se.csv"
+
+# The label_id that AK is EXCLUDED from (per labels_v2_spec.md §Labellers)
+# and that the SE subset MUST include.
+_V2_EXCLUDED_FOR_AK = "L001"
+
+
+def _read_key_rows(path: Path) -> list[dict]:
+    """Read labels_v1_KEY.csv, skipping '#' comment header lines."""
+    if not path.exists():
+        raise SystemExit(
+            f"STOP: {path} not found. Run scripts/sample_benchmark_v1.py "
+            "first to produce the KEY."
+        )
+    with open(path, newline="", encoding="utf-8") as f:
+        lines = f.readlines()
+    data_lines = [ln for ln in lines if not ln.startswith("#")]
+    return list(csv.DictReader(data_lines))
+
+
+def _read_template_label_ids(path: Path) -> list[str]:
+    with open(path, newline="", encoding="utf-8") as f:
+        return [row["label_id"] for row in csv.DictReader(f)]
+
+
+def _pick_se_subset(
+    current_15: list[str],
+    label_to_stratum: dict,
+    must_include: str,
+) -> tuple[list[str], str]:
+    """If `must_include` isn't already in `current_15`, swap it in and drop
+    the alphabetically-last label_id of the SAME stratum from the current
+    selection. Returns (new_15_sorted, human_readable_swap_note).
+
+    Deterministic. Pure. Tested.
+
+    Raises SystemExit if the stratum split can't be preserved (no same-
+    stratum item to drop) — indicates a broken input, not a swap decision
+    the code should make silently.
+    """
+    if must_include in current_15:
+        return sorted(current_15), (
+            f"{must_include} already in the existing 15; no swap needed."
+        )
+    include_stratum = label_to_stratum[must_include]
+    same_stratum_in_15 = sorted(
+        lid for lid in current_15
+        if label_to_stratum[lid] == include_stratum
+    )
+    if not same_stratum_in_15:
+        raise SystemExit(
+            f"STOP: cannot preserve 10/5 split — {must_include} is "
+            f"{include_stratum!r} but the existing 15 contains none of "
+            "that stratum."
+        )
+    dropped = same_stratum_in_15[-1]
+    new_15 = sorted([lid for lid in current_15 if lid != dropped]
+                    + [must_include])
+    note = (
+        f"{must_include} not in the existing 15. Swapped in {must_include} "
+        f"and dropped {dropped} — the alphabetically-last {include_stratum} "
+        "in the existing selection. Keeps the 10/5 stratum split intact."
+    )
+    return new_15, note
+
+
+def _write_v2_template(path: Path, label_ids: list[str],
+                       label_to_signal: dict) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["label_id", "signal", "label", "reason",
+                    "labeller", "labelled_at"])
+        for lid in label_ids:
+            w.writerow([lid, label_to_signal[lid], "", "", "", ""])
+
+
+def _build_v2_templates() -> int:
+    """Build labels_v2_TEMPLATE_ak.csv (43 items, all except L001) and
+    labels_v2_TEMPLATE_se.csv (15 items, MUST include L001). Reads from
+    labels_v1_KEY.csv + labels_v1_graham_TEMPLATE.csv. v1 templates are
+    left untouched. Prints the swap decision so the audit trail lives in
+    stdout as well as in git history."""
+    print(f"Reading {KEY_PATH.relative_to(REPO_ROOT)} for label_id -> "
+          "stratum, signal mapping...")
+    key_rows = _read_key_rows(KEY_PATH)
+    if len(key_rows) != N_TOTAL:
+        raise SystemExit(
+            f"STOP: expected {N_TOTAL} rows in KEY, got {len(key_rows)}"
+        )
+    label_to_stratum = {r["label_id"]: r["stratum"] for r in key_rows}
+    label_to_signal = {r["label_id"]: r["signal"] for r in key_rows}
+
+    print(f"Reading {GRAHAM_PATH.relative_to(REPO_ROOT)} for the existing "
+          "15-item subset...")
+    current_15 = _read_template_label_ids(GRAHAM_PATH)
+    if len(current_15) != (GRAHAM_N_SURVIVORS + GRAHAM_N_KILLED):
+        raise SystemExit(
+            f"STOP: expected 15 rows in existing graham template, got "
+            f"{len(current_15)}"
+        )
+
+    se_15, swap_note = _pick_se_subset(
+        current_15, label_to_stratum, _V2_EXCLUDED_FOR_AK,
+    )
+    print(f"\nSE-subset decision: {swap_note}")
+
+    # Verify final composition.
+    surv = [lid for lid in se_15 if label_to_stratum[lid] == "survivor"]
+    kill = [lid for lid in se_15 if label_to_stratum[lid] == "killed"]
+    if len(surv) != GRAHAM_N_SURVIVORS or len(kill) != GRAHAM_N_KILLED:
+        raise SystemExit(
+            f"STOP: SE subset stratum split is {len(surv)}/{len(kill)}, "
+            f"expected {GRAHAM_N_SURVIVORS}/{GRAHAM_N_KILLED}."
+        )
+    if _V2_EXCLUDED_FOR_AK not in se_15:
+        raise SystemExit(
+            f"STOP: {_V2_EXCLUDED_FOR_AK} missing from SE subset."
+        )
+
+    # AK gets everything except the excluded label_id.
+    ak_43 = sorted(lid for lid in label_to_stratum
+                   if lid != _V2_EXCLUDED_FOR_AK)
+    if len(ak_43) != N_TOTAL - 1:
+        raise SystemExit(
+            f"STOP: AK template size is {len(ak_43)}, expected "
+            f"{N_TOTAL - 1}."
+        )
+
+    _write_v2_template(V2_TEMPLATE_AK_PATH, ak_43, label_to_signal)
+    print(f"Wrote {V2_TEMPLATE_AK_PATH.relative_to(REPO_ROOT)}  "
+          f"({len(ak_43)} label_ids, excludes {_V2_EXCLUDED_FOR_AK})")
+
+    _write_v2_template(V2_TEMPLATE_SE_PATH, se_15, label_to_signal)
+    print(f"Wrote {V2_TEMPLATE_SE_PATH.relative_to(REPO_ROOT)}  "
+          f"({len(se_15)} label_ids, includes {_V2_EXCLUDED_FOR_AK})")
+
+    # Overlap sanity: SE items minus L001 should overlap with AK (they'll
+    # all be there); AK never contains L001.
+    assert _V2_EXCLUDED_FOR_AK not in ak_43
+    assert _V2_EXCLUDED_FOR_AK in se_15
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Smoke test — synthetic series through the real rendering code path
 # ---------------------------------------------------------------------------
 
@@ -407,7 +556,10 @@ def _write_graham_template(assigned, graham_label_ids, path: Path) -> None:
 def validate_labels(path) -> list[str]:
     """Return list of human-readable problem strings; empty = valid.
     Enforces: label in {TRUE, FALSE, UNSURE}, non-empty reason, non-empty
-    labeller. A blank reason is a HARD reject per benchmark/labels_v1_spec.md.
+    labeller. A blank reason is a HARD reject per benchmark/labels_v2_spec.md.
+    Intended targets: benchmark/labels_v2_TEMPLATE_ak.csv (once filled by AK)
+    and benchmark/labels_v2_TEMPLATE_se.csv (once filled by the second
+    labeller).
     """
     problems: list[str] = []
     with open(path, newline="", encoding="utf-8") as f:
@@ -469,10 +621,19 @@ def main() -> int:
         help="Render 3 synthetic plots to benchmark/plots_smoketest/ to "
              "verify the rendering pipeline. No BigQuery, no real series.",
     )
+    mode.add_argument(
+        "--v2-templates", action="store_true",
+        help="Build labels_v2_TEMPLATE_ak.csv (43) and "
+             "labels_v2_TEMPLATE_se.csv (15, must include L001). Reads v1 "
+             "KEY + graham TEMPLATE. No BigQuery. Does not re-render plots.",
+    )
     args = parser.parse_args()
 
     if args.smoke_test:
         return _smoke_test()
+
+    if args.v2_templates:
+        return _build_v2_templates()
 
     bq = _default_client()
     print(f"Fetching latest verdicts under {CONFIG_VERSION}...")

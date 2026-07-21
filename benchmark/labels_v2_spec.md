@@ -128,13 +128,21 @@ days. The rule is for future batches.
   as the labels when a disagreement gets adjudicated later.
 - Record UNSURE freely rather than guessing.
 
-## Second labeller
-Graham labels 15 events drawn from the SAME 44 sample (10 survivors, 5
-UNDERMINEs), not an additional 15. He sees the same blinded plots and
-label IDs; only the 15 overlap events are on his sheet. Agreement on
-that overlap sets the ceiling on any score the verifier can achieve.
-Report raw agreement and Cohen's kappa before reporting any verifier
-metric.
+## Labellers
+**Primary labeller (AK)**: labels 43 of the 44 events. **L001 is EXCLUDED**
+for AK — he has already seen the underlying series during earlier work on
+that event — and must be labelled by the second labeller only.
+
+**Second labeller (SE, a solution engineer)**: labels 15 of the 44 events,
+drawn as 10 survivors + 5 UNDERMINEs using the existing sampling seed.
+**L001 must be one of the 15.** If the seeded selection does not already
+contain L001, swap it in and drop one other survivor (the alphabetically-
+last survivor in the current selection) to keep the 10/5 stratum split
+intact.
+
+Agreement between AK and SE is computed on those 15 overlapping events.
+It sets the ceiling on any score the verifier can achieve. Report raw
+agreement and Cohen's kappa before reporting any verifier metric.
 
 **Kappa at n=15 is directional only** — treat it as "the two labellers
 appear to agree well / poorly / not at all" rather than a precise

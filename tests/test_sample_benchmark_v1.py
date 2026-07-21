@@ -155,6 +155,44 @@ def test_normalize_drops_nulls():
     assert n == sbv1.BASELINE_DAYS // 2
 
 
+def test_pick_se_subset_swaps_when_must_include_missing():
+    """L001-not-in-15 → swap in L001, drop alphabetically-last survivor."""
+    current_15 = [
+        "L002", "L008", "L009", "L011", "L016", "L021", "L033",
+        "L034", "L036", "L040",              # 10 survivors
+        "L004", "L018", "L019", "L029", "L031",  # 5 killed
+    ]
+    label_to_stratum = {lid: "survivor" for lid in
+                        ("L001", "L002", "L008", "L009", "L011", "L016",
+                         "L021", "L033", "L034", "L036", "L040")}
+    label_to_stratum.update({lid: "killed" for lid in
+                             ("L004", "L018", "L019", "L029", "L031")})
+    new_15, note = sbv1._pick_se_subset(current_15, label_to_stratum, "L001")
+    assert len(new_15) == 15
+    assert "L001" in new_15
+    assert "L040" not in new_15, "should drop L040 as alphabetically-last survivor"
+    surv = [lid for lid in new_15 if label_to_stratum[lid] == "survivor"]
+    kill = [lid for lid in new_15 if label_to_stratum[lid] == "killed"]
+    assert len(surv) == 10 and len(kill) == 5
+    assert "L040" in note and "L001" in note
+
+
+def test_pick_se_subset_noop_when_must_include_already_present():
+    current_15 = ["L001", "L002", "L004"]
+    label_to_stratum = {"L001": "survivor", "L002": "survivor", "L004": "killed"}
+    new_15, note = sbv1._pick_se_subset(current_15, label_to_stratum, "L001")
+    assert new_15 == sorted(current_15)
+    assert "no swap needed" in note
+
+
+def test_pick_se_subset_stops_when_no_same_stratum_to_drop():
+    import pytest
+    current_15 = ["L004", "L018"]  # all killed
+    label_to_stratum = {"L001": "survivor", "L004": "killed", "L018": "killed"}
+    with pytest.raises(SystemExit, match="cannot preserve"):
+        sbv1._pick_se_subset(current_15, label_to_stratum, "L001")
+
+
 def test_validate_labels_flags_all_error_shapes(tmp_path):
     import csv
     p = tmp_path / "labels.csv"
