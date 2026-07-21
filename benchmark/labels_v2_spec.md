@@ -131,25 +131,41 @@ days. The rule is for future batches.
 ## Labellers
 **Primary labeller (AK)**: labels 43 of the 44 events. **L001 is EXCLUDED**
 for AK — he has already seen the underlying series during earlier work on
-that event — and must be labelled by the second labeller only.
+that event — and must be labelled by the second labellers only.
 
-**Second labeller (SE, a solution engineer)**: labels 15 of the 44 events,
-drawn as 10 survivors + 5 UNDERMINEs using the existing sampling seed.
-**L001 must be one of the 15.** If the seeded selection does not already
-contain L001, swap it in and drop one other survivor (the alphabetically-
-last survivor in the current selection) to keep the 10/5 stratum split
-intact.
+**Second labellers (r1 / r2 / r3 — two solution engineers plus one account
+manager)**: together label the full 44. Structure:
 
-Agreement between AK and SE is computed on those 15 overlapping events.
-It sets the ceiling on any score the verifier can achieve. Report raw
-agreement and Cohen's kappa before reporting any verifier metric.
+- **Common core of 14 label_ids** — labelled by all three raters. Composed
+  of **9 survivors + 5 UNDERMINEs** and MUST include L001.
+- **Three disjoint blocks of 10** — one block per rater, splitting the
+  remaining 30 label_ids.
+- Each rater therefore labels **24 charts** (14 core + 10 block).
+- Every one of the 44 events receives at least one second label; the 14
+  core events receive three.
 
-**Kappa at n=15 is directional only** — treat it as "the two labellers
-appear to agree well / poorly / not at all" rather than a precise
-figure. The confidence interval on kappa at that sample size is wide
-enough that ±0.2 shifts are within noise. Do not tune anything against a
-specific kappa value; use it only to decide whether the definition
-itself needs revision.
+Selection is deterministic from the existing sampling seed
+(`RANDOM_SEED = 20260720`), computed by
+`scripts/sample_benchmark_v1._pick_core_and_blocks`. The specific
+label_ids in the core and in each block are pinned to disk in
+`labels_v2_TEMPLATE_r{1,2,3}.csv` and to git history via that function's
+unit tests.
+
+**Agreement metrics** — report BEFORE any verifier metric:
+- **Three-way agreement on the common core**: Fleiss' kappa (Cohen's
+  kappa is two-rater only and does not apply here). Also report raw
+  three-way agreement rate (fraction of core items where all three
+  raters chose the same label).
+- **AK-vs-each-rater pairwise agreement on the core**: 13-of-14 for each
+  pair (AK does not label L001, so that item drops from every AK
+  pairwise calculation). Cohen's kappa is appropriate here.
+
+**Kappa at n=14 is directional only** — treat it as "the raters appear
+to agree well / poorly / not at all" rather than a precise figure. The
+confidence interval on kappa at that sample size is wide enough that
+±0.2 shifts are within noise. Do not tune anything against a specific
+kappa value; use it only to decide whether the definition itself needs
+revision.
 
 If agreement is poor (kappa directionally < ~0.4), the definition above
 is the problem, not the verifier. Revise this document to a v3, re-label,

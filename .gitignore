@@ -7,6 +7,12 @@
 # labels_v1.csv to live in git.
 !benchmark/*.csv
 
+# Per-rater share bundles are ephemeral distributables (regenerated from
+# the KEY + plots on demand). Never commit them — they carry copies of
+# the blinded plots and could be mistaken for the source of truth.
+benchmark/share_*/
+benchmark/share_*.zip
+
 # Python
 __pycache__/
 *.pyc

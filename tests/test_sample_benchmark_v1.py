@@ -193,6 +193,72 @@ def test_pick_se_subset_stops_when_no_same_stratum_to_drop():
         sbv1._pick_se_subset(current_15, label_to_stratum, "L001")
 
 
+def _fake_44_label_to_stratum():
+    """44 label_ids matching the real sample: 29 survivors + 15 killed."""
+    surv = {f"L{i:03d}": "survivor" for i in range(1, 30)}
+    kill = {f"L{i:03d}": "killed" for i in range(30, 45)}
+    return {**surv, **kill}
+
+
+def test_pick_core_and_blocks_is_deterministic():
+    """Same seed + same inputs → identical assignment."""
+    lts = _fake_44_label_to_stratum()
+    a = sbv1._pick_core_and_blocks(lts, "L001", sbv1.RANDOM_SEED)
+    b = sbv1._pick_core_and_blocks(lts, "L001", sbv1.RANDOM_SEED)
+    assert a == b
+
+
+def test_pick_core_and_blocks_shape_and_composition():
+    lts = _fake_44_label_to_stratum()
+    sets = sbv1._pick_core_and_blocks(lts, "L001", sbv1.RANDOM_SEED)
+    assert len(sets["core"]) == sbv1._CORE_N == 14
+    for r in sbv1._RATERS:
+        assert len(sets[r]) == sbv1._BLOCK_N == 10
+    core_surv = [lid for lid in sets["core"] if lts[lid] == "survivor"]
+    core_kill = [lid for lid in sets["core"] if lts[lid] == "killed"]
+    assert len(core_surv) == sbv1._CORE_N_SURVIVORS == 9
+    assert len(core_kill) == sbv1._CORE_N_KILLED == 5
+
+
+def test_pick_core_and_blocks_must_include_lands_in_core():
+    lts = _fake_44_label_to_stratum()
+    sets = sbv1._pick_core_and_blocks(lts, "L001", sbv1.RANDOM_SEED)
+    assert "L001" in sets["core"]
+    for r in sbv1._RATERS:
+        assert "L001" not in sets[r]
+
+
+def test_pick_core_and_blocks_blocks_are_disjoint():
+    lts = _fake_44_label_to_stratum()
+    sets = sbv1._pick_core_and_blocks(lts, "L001", sbv1.RANDOM_SEED)
+    r1, r2, r3 = set(sets["r1"]), set(sets["r2"]), set(sets["r3"])
+    assert not (r1 & r2)
+    assert not (r1 & r3)
+    assert not (r2 & r3)
+
+
+def test_pick_core_and_blocks_covers_all_44():
+    lts = _fake_44_label_to_stratum()
+    sets = sbv1._pick_core_and_blocks(lts, "L001", sbv1.RANDOM_SEED)
+    covered = set(sets["core"]) | set(sets["r1"]) | set(sets["r2"]) | set(sets["r3"])
+    assert covered == set(lts.keys())
+    assert len(covered) == 44
+
+
+def test_pick_core_and_blocks_blocks_disjoint_from_core():
+    lts = _fake_44_label_to_stratum()
+    sets = sbv1._pick_core_and_blocks(lts, "L001", sbv1.RANDOM_SEED)
+    core = set(sets["core"])
+    for r in sbv1._RATERS:
+        assert not (core & set(sets[r]))
+
+
+def test_pick_core_and_blocks_stops_when_must_include_not_survivor():
+    lts = _fake_44_label_to_stratum()
+    with pytest.raises(SystemExit, match="must be a survivor"):
+        sbv1._pick_core_and_blocks(lts, "L030", sbv1.RANDOM_SEED)  # L030 is killed
+
+
 def test_validate_labels_flags_all_error_shapes(tmp_path):
     import csv
     p = tmp_path / "labels.csv"

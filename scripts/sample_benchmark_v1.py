@@ -289,11 +289,32 @@ def _render_placeholder(label_id, signal, out_path, message):
 
 # v2 output paths — v1 templates stay in git untouched for the record.
 V2_TEMPLATE_AK_PATH = BENCHMARK_DIR / "labels_v2_TEMPLATE_ak.csv"
+# Superseded by the r1/r2/r3 templates below (see NOTE on _pick_se_subset).
+# The se.csv file itself remains on disk for the record.
 V2_TEMPLATE_SE_PATH = BENCHMARK_DIR / "labels_v2_TEMPLATE_se.csv"
+V2_TEMPLATE_R_PATHS = {
+    f"r{i}": BENCHMARK_DIR / f"labels_v2_TEMPLATE_r{i}.csv"
+    for i in (1, 2, 3)
+}
 
 # The label_id that AK is EXCLUDED from (per labels_v2_spec.md §Labellers)
-# and that the SE subset MUST include.
+# and that the core MUST include.
 _V2_EXCLUDED_FOR_AK = "L001"
+
+# Rater-share directories and zips for the second-labeller distribution.
+SHARE_DIR_TEMPLATE = "share_{rater}"
+SHARE_ZIP_TEMPLATE = "share_{rater}.zip"
+# The one practice plot each rater sees as a worked example.
+PRACTICE_WORKED_EXAMPLE_PATH = BENCHMARK_DIR / "plots_practice" / "P008.png"
+
+# Common core + per-rater block sizes (see labels_v2_spec.md §Labellers).
+_CORE_N_SURVIVORS = 9
+_CORE_N_KILLED = 5
+_CORE_N = _CORE_N_SURVIVORS + _CORE_N_KILLED  # 14
+_BLOCK_N = 10
+_RATER_N = _CORE_N + _BLOCK_N  # 24 per rater
+_TOTAL_LABEL_IDS = N_TOTAL  # 44
+_RATERS = ("r1", "r2", "r3")
 
 
 def _read_key_rows(path: Path) -> list[dict]:
@@ -319,7 +340,11 @@ def _pick_se_subset(
     label_to_stratum: dict,
     must_include: str,
 ) -> tuple[list[str], str]:
-    """If `must_include` isn't already in `current_15`, swap it in and drop
+    """SUPERSEDED — historical single-SE swap logic. Left in place because
+    labels_v2_TEMPLATE_se.csv (the artifact it produced) remains on disk
+    for the record. The three-rater flow uses _pick_core_and_blocks below.
+
+    If `must_include` isn't already in `current_15`, swap it in and drop
     the alphabetically-last label_id of the SAME stratum from the current
     selection. Returns (new_15_sorted, human_readable_swap_note).
 
@@ -365,12 +390,91 @@ def _write_v2_template(path: Path, label_ids: list[str],
             w.writerow([lid, label_to_signal[lid], "", "", "", ""])
 
 
+def _pick_core_and_blocks(
+    label_to_stratum: dict,
+    must_include: str,
+    seed: int,
+) -> dict:
+    """Deterministic three-rater assignment per labels_v2_spec.md §Labellers.
+
+    Composition:
+      - Common core of _CORE_N (14) label_ids: _CORE_N_SURVIVORS (9)
+        survivors + _CORE_N_KILLED (5) killed. `must_include` (a survivor)
+        is forced into the core.
+      - The remaining 30 label_ids are shuffled and split into three
+        disjoint blocks of _BLOCK_N (10) each: r1, r2, r3.
+
+    Returns:
+      {"core": [14 label_ids sorted],
+       "r1":   [10 label_ids sorted],
+       "r2":   [10 label_ids sorted],
+       "r3":   [10 label_ids sorted]}
+
+    Deterministic in (label_to_stratum keys, must_include, seed). Pure.
+    Fresh Random(seed) is used so this doesn't depend on any other rng
+    state from the main sampling.
+    """
+    if label_to_stratum.get(must_include) != "survivor":
+        raise SystemExit(
+            f"STOP: {must_include} must be a survivor; got "
+            f"{label_to_stratum.get(must_include)!r}."
+        )
+
+    survivors = sorted(lid for lid, s in label_to_stratum.items()
+                       if s == "survivor")
+    killed = sorted(lid for lid, s in label_to_stratum.items()
+                    if s == "killed")
+    remaining_survivors = [s for s in survivors if s != must_include]
+
+    if len(remaining_survivors) < _CORE_N_SURVIVORS - 1:
+        raise SystemExit(
+            f"STOP: not enough survivors to fill core "
+            f"({len(remaining_survivors)} available besides "
+            f"{must_include}, need {_CORE_N_SURVIVORS - 1})."
+        )
+    if len(killed) < _CORE_N_KILLED:
+        raise SystemExit(
+            f"STOP: not enough killed to fill core "
+            f"({len(killed)} available, need {_CORE_N_KILLED})."
+        )
+
+    rng = random.Random(seed)
+    core_extra_surv = rng.sample(remaining_survivors, _CORE_N_SURVIVORS - 1)
+    core_killed = rng.sample(killed, _CORE_N_KILLED)
+    core = sorted([must_include] + core_extra_surv + core_killed)
+
+    core_set = set(core)
+    non_core = sorted(lid for lid in label_to_stratum if lid not in core_set)
+    if len(non_core) != _BLOCK_N * len(_RATERS):
+        raise SystemExit(
+            f"STOP: expected {_BLOCK_N * len(_RATERS)} non-core items, "
+            f"got {len(non_core)}."
+        )
+
+    rng.shuffle(non_core)
+    blocks = {
+        _RATERS[i]: sorted(non_core[i * _BLOCK_N:(i + 1) * _BLOCK_N])
+        for i in range(len(_RATERS))
+    }
+
+    return {"core": core, **blocks}
+
+
 def _build_v2_templates() -> int:
-    """Build labels_v2_TEMPLATE_ak.csv (43 items, all except L001) and
-    labels_v2_TEMPLATE_se.csv (15 items, MUST include L001). Reads from
-    labels_v1_KEY.csv + labels_v1_graham_TEMPLATE.csv. v1 templates are
-    left untouched. Prints the swap decision so the audit trail lives in
-    stdout as well as in git history."""
+    """Build the four v2 labelling templates:
+      - labels_v2_TEMPLATE_ak.csv  (43, all except L001)
+      - labels_v2_TEMPLATE_r1.csv  (24 = 14 core + block 1)
+      - labels_v2_TEMPLATE_r2.csv  (24 = 14 core + block 2)
+      - labels_v2_TEMPLATE_r3.csv  (24 = 14 core + block 3)
+
+    The single-rater labels_v2_TEMPLATE_se.csv from the previous design is
+    NOT re-written; it stays on disk untouched for the record. v1 templates
+    likewise stay untouched.
+
+    Reads label_id -> stratum, signal from labels_v1_KEY.csv. Selection is
+    deterministic in RANDOM_SEED via _pick_core_and_blocks. Prints the core
+    + each block so the audit trail lives in stdout as well as in git.
+    """
     print(f"Reading {KEY_PATH.relative_to(REPO_ROOT)} for label_id -> "
           "stratum, signal mapping...")
     key_rows = _read_key_rows(KEY_PATH)
@@ -381,54 +485,194 @@ def _build_v2_templates() -> int:
     label_to_stratum = {r["label_id"]: r["stratum"] for r in key_rows}
     label_to_signal = {r["label_id"]: r["signal"] for r in key_rows}
 
-    print(f"Reading {GRAHAM_PATH.relative_to(REPO_ROOT)} for the existing "
-          "15-item subset...")
-    current_15 = _read_template_label_ids(GRAHAM_PATH)
-    if len(current_15) != (GRAHAM_N_SURVIVORS + GRAHAM_N_KILLED):
-        raise SystemExit(
-            f"STOP: expected 15 rows in existing graham template, got "
-            f"{len(current_15)}"
-        )
-
-    se_15, swap_note = _pick_se_subset(
-        current_15, label_to_stratum, _V2_EXCLUDED_FOR_AK,
+    print(f"Computing core + r1/r2/r3 blocks (seed={RANDOM_SEED})...")
+    sets = _pick_core_and_blocks(
+        label_to_stratum, _V2_EXCLUDED_FOR_AK, RANDOM_SEED,
     )
-    print(f"\nSE-subset decision: {swap_note}")
+    core = sets["core"]
 
-    # Verify final composition.
-    surv = [lid for lid in se_15 if label_to_stratum[lid] == "survivor"]
-    kill = [lid for lid in se_15 if label_to_stratum[lid] == "killed"]
-    if len(surv) != GRAHAM_N_SURVIVORS or len(kill) != GRAHAM_N_KILLED:
+    # ---- invariants ----
+    if len(core) != _CORE_N:
+        raise SystemExit(f"STOP: core size {len(core)} != {_CORE_N}")
+    core_surv = [lid for lid in core if label_to_stratum[lid] == "survivor"]
+    core_kill = [lid for lid in core if label_to_stratum[lid] == "killed"]
+    if (len(core_surv), len(core_kill)) != (_CORE_N_SURVIVORS, _CORE_N_KILLED):
         raise SystemExit(
-            f"STOP: SE subset stratum split is {len(surv)}/{len(kill)}, "
-            f"expected {GRAHAM_N_SURVIVORS}/{GRAHAM_N_KILLED}."
+            f"STOP: core stratum split {len(core_surv)}/{len(core_kill)}, "
+            f"expected {_CORE_N_SURVIVORS}/{_CORE_N_KILLED}."
         )
-    if _V2_EXCLUDED_FOR_AK not in se_15:
+    if _V2_EXCLUDED_FOR_AK not in core:
         raise SystemExit(
-            f"STOP: {_V2_EXCLUDED_FOR_AK} missing from SE subset."
+            f"STOP: {_V2_EXCLUDED_FOR_AK} must be in core; not found."
+        )
+    # Blocks disjoint from each other AND from the core.
+    r1s, r2s, r3s = (set(sets["r1"]), set(sets["r2"]), set(sets["r3"]))
+    core_set = set(core)
+    if r1s & r2s or r1s & r3s or r2s & r3s:
+        raise SystemExit("STOP: rater blocks overlap.")
+    if r1s & core_set or r2s & core_set or r3s & core_set:
+        raise SystemExit("STOP: rater blocks intersect the core.")
+    covered = core_set | r1s | r2s | r3s
+    if covered != set(label_to_stratum):
+        missing = set(label_to_stratum) - covered
+        extra = covered - set(label_to_stratum)
+        raise SystemExit(
+            f"STOP: core + blocks do not cover all 44 (missing={missing}, "
+            f"extra={extra})."
         )
 
-    # AK gets everything except the excluded label_id.
+    # ---- write files ----
     ak_43 = sorted(lid for lid in label_to_stratum
                    if lid != _V2_EXCLUDED_FOR_AK)
-    if len(ak_43) != N_TOTAL - 1:
+    if len(ak_43) != _TOTAL_LABEL_IDS - 1:
         raise SystemExit(
-            f"STOP: AK template size is {len(ak_43)}, expected "
-            f"{N_TOTAL - 1}."
+            f"STOP: AK template size {len(ak_43)} != {_TOTAL_LABEL_IDS - 1}"
         )
-
     _write_v2_template(V2_TEMPLATE_AK_PATH, ak_43, label_to_signal)
-    print(f"Wrote {V2_TEMPLATE_AK_PATH.relative_to(REPO_ROOT)}  "
+    print(f"\nWrote {V2_TEMPLATE_AK_PATH.relative_to(REPO_ROOT)}  "
           f"({len(ak_43)} label_ids, excludes {_V2_EXCLUDED_FOR_AK})")
 
-    _write_v2_template(V2_TEMPLATE_SE_PATH, se_15, label_to_signal)
-    print(f"Wrote {V2_TEMPLATE_SE_PATH.relative_to(REPO_ROOT)}  "
-          f"({len(se_15)} label_ids, includes {_V2_EXCLUDED_FOR_AK})")
+    for rater in _RATERS:
+        rater_ids = sorted(core_set | set(sets[rater]))
+        if len(rater_ids) != _RATER_N:
+            raise SystemExit(
+                f"STOP: {rater} template size {len(rater_ids)} != "
+                f"{_RATER_N}"
+            )
+        # No duplicates within one rater's file (guaranteed by set union;
+        # asserted anyway for defensiveness).
+        assert len(rater_ids) == len(set(rater_ids)), \
+            f"{rater} has duplicate label_ids"
+        _write_v2_template(
+            V2_TEMPLATE_R_PATHS[rater], rater_ids, label_to_signal,
+        )
+        print(f"Wrote {V2_TEMPLATE_R_PATHS[rater].relative_to(REPO_ROOT)}  "
+              f"({len(rater_ids)} = {_CORE_N} core + {_BLOCK_N} block)")
 
-    # Overlap sanity: SE items minus L001 should overlap with AK (they'll
-    # all be there); AK never contains L001.
-    assert _V2_EXCLUDED_FOR_AK not in ak_43
-    assert _V2_EXCLUDED_FOR_AK in se_15
+    # ---- audit-trail dump ----
+    print(f"\nCommon core ({len(core)}): {core}")
+    for rater in _RATERS:
+        print(f"Block {rater} ({len(sets[rater])}): {sets[rater]}")
+    print(f"\nAK template excludes: {_V2_EXCLUDED_FOR_AK}")
+    print(f"labels_v2_TEMPLATE_se.csv left on disk untouched (superseded).")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# --share-raters: build per-rater share folders + zips
+# ---------------------------------------------------------------------------
+
+def _share_raters() -> int:
+    """For each rater in _RATERS, build benchmark/share_rN/ containing:
+      - that rater's 24 real-plot PNGs (from plots_v1/),
+      - benchmark/plots_practice/P008.png as a worked example,
+      - benchmark/labels_v2_TEMPLATE_rN.csv,
+    and zip it to benchmark/share_rN.zip.
+
+    Guards (STOP on any failure — never silently ship a leaky bundle):
+      - each share folder must contain exactly _RATER_N + 2 files
+        (24 rater PNGs + 1 practice PNG + 1 CSV = 26),
+      - no KEY, ANSWERS, or non-rater plot may appear,
+      - the zip contents mirror the folder contents.
+    """
+    import shutil
+    import zipfile
+
+    if not PRACTICE_WORKED_EXAMPLE_PATH.exists():
+        raise SystemExit(
+            f"STOP: {PRACTICE_WORKED_EXAMPLE_PATH} missing. Run "
+            "scripts/sample_practice_set.py before --share-raters."
+        )
+
+    # Re-compute the rater sets deterministically from the KEY. Do not
+    # trust the on-disk templates for what a rater is meant to see —
+    # regenerating from the KEY makes the share bundles self-consistent
+    # with the current spec/seed.
+    key_rows = _read_key_rows(KEY_PATH)
+    label_to_stratum = {r["label_id"]: r["stratum"] for r in key_rows}
+    sets = _pick_core_and_blocks(
+        label_to_stratum, _V2_EXCLUDED_FOR_AK, RANDOM_SEED,
+    )
+    core_set = set(sets["core"])
+
+    for rater in _RATERS:
+        rater_ids = sorted(core_set | set(sets[rater]))
+        if len(rater_ids) != _RATER_N:
+            raise SystemExit(
+                f"STOP: {rater} has {len(rater_ids)} ids, expected {_RATER_N}"
+            )
+        rater_id_set = set(rater_ids)
+
+        share_dir = BENCHMARK_DIR / SHARE_DIR_TEMPLATE.format(rater=rater)
+        if share_dir.exists():
+            shutil.rmtree(share_dir)
+        share_dir.mkdir(parents=True)
+
+        # Copy the 24 rater PNGs from plots_v1/.
+        for lid in rater_ids:
+            src = PLOTS_DIR / f"{lid}.png"
+            if not src.exists():
+                raise SystemExit(f"STOP: missing plot {src}")
+            shutil.copy2(src, share_dir / f"{lid}.png")
+
+        # Copy the worked-example practice PNG.
+        shutil.copy2(PRACTICE_WORKED_EXAMPLE_PATH,
+                     share_dir / PRACTICE_WORKED_EXAMPLE_PATH.name)
+
+        # Copy the rater's template CSV.
+        template_src = V2_TEMPLATE_R_PATHS[rater]
+        if not template_src.exists():
+            raise SystemExit(
+                f"STOP: {template_src} missing. Run --v2-templates first."
+            )
+        shutil.copy2(template_src, share_dir / template_src.name)
+
+        # ---- guards ----
+        contents = sorted(share_dir.iterdir())
+        expected_n = _RATER_N + 2  # 24 rater PNGs + 1 practice PNG + 1 CSV
+        if len(contents) != expected_n:
+            raise SystemExit(
+                f"STOP: {share_dir} has {len(contents)} files, "
+                f"expected {expected_n}."
+            )
+        for f in contents:
+            n = f.name
+            if "KEY" in n or "ANSWERS" in n:
+                raise SystemExit(
+                    f"STOP: forbidden file {f} in share bundle."
+                )
+            if f.suffix.lower() == ".png":
+                allowed = rater_id_set | {PRACTICE_WORKED_EXAMPLE_PATH.name.rsplit(".", 1)[0]}
+                stem = f.stem
+                if stem not in allowed:
+                    raise SystemExit(
+                        f"STOP: unexpected plot {f} in {share_dir} — "
+                        f"not in rater {rater}'s 24 nor the practice "
+                        "worked example."
+                    )
+            elif f.suffix.lower() == ".csv":
+                if f.name != template_src.name:
+                    raise SystemExit(
+                        f"STOP: unexpected CSV {f} in {share_dir}"
+                    )
+            else:
+                raise SystemExit(
+                    f"STOP: unexpected file type {f} in {share_dir}"
+                )
+
+        # ---- zip ----
+        zip_path = BENCHMARK_DIR / SHARE_ZIP_TEMPLATE.format(rater=rater)
+        if zip_path.exists():
+            zip_path.unlink()
+        with zipfile.ZipFile(zip_path, "w",
+                             compression=zipfile.ZIP_DEFLATED) as zf:
+            for f in contents:
+                zf.write(f, arcname=f.name)
+
+        print(f"share_{rater}: {len(contents)} files in "
+              f"{share_dir.relative_to(REPO_ROOT)}, zipped to "
+              f"{zip_path.relative_to(REPO_ROOT)}.")
+
     return 0
 
 
@@ -623,9 +867,17 @@ def main() -> int:
     )
     mode.add_argument(
         "--v2-templates", action="store_true",
-        help="Build labels_v2_TEMPLATE_ak.csv (43) and "
-             "labels_v2_TEMPLATE_se.csv (15, must include L001). Reads v1 "
-             "KEY + graham TEMPLATE. No BigQuery. Does not re-render plots.",
+        help="Build labels_v2_TEMPLATE_ak.csv (43), labels_v2_TEMPLATE_r1.csv "
+             "(24), labels_v2_TEMPLATE_r2.csv (24), labels_v2_TEMPLATE_r3.csv "
+             "(24). Reads v1 KEY. No BigQuery. Does not re-render plots. The "
+             "single-rater se.csv from the previous design stays on disk "
+             "untouched.",
+    )
+    mode.add_argument(
+        "--share-raters", action="store_true",
+        help="Build benchmark/share_r{1,2,3}/ (each 24 rater PNGs + P008 "
+             "worked example + rater template CSV = 26 files) and zip each. "
+             "Fails loudly if any KEY/ANSWERS or non-rater plot leaks in.",
     )
     args = parser.parse_args()
 
@@ -634,6 +886,9 @@ def main() -> int:
 
     if args.v2_templates:
         return _build_v2_templates()
+
+    if args.share_raters:
+        return _share_raters()
 
     bq = _default_client()
     print(f"Fetching latest verdicts under {CONFIG_VERSION}...")
